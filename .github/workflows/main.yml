@@ -1422,6 +1422,78 @@ jobs:
       #    full save (everything)   every 15 min  -> `backup` branch
       #    both survive cancels; final push goes to `main`
       # ─────────────────────────────────────────────────────────────
+      # ── TLS TRUST: the app pins the gateway certificate on first use ──
+      - name: Publish gateway certificate fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TG_API="https://api.telegram.org"
+
+          if [ -z "${TUNNEL_URL:-}" ]; then
+            echo "::warning::No public address, skipping certificate fingerprint"
+            exit 0
+          fi
+
+          HOST="${TUNNEL_URL#https://}"
+          HOST="${HOST%%/*}"
+
+          # the app wants the fingerprint of whatever terminates TLS, which for
+          # Tailscale Funnel is the tailnet edge, not the runner itself
+          FINGERPRINT=""
+          for ATTEMPT in 1 2 3; do
+            RAW="$(echo |
+              openssl s_client -servername "$HOST" -connect "${HOST}:443" \
+                2>/dev/null |
+              openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+            FINGERPRINT="$(printf '%s' "$RAW" |
+              sed 's/.*Fingerprint=//' | tr -d ' \r\n')"
+            if [ -n "$FINGERPRINT" ]; then
+              break
+            fi
+            echo "certificate read failed, retrying ($ATTEMPT/3)"
+            sleep 5
+          done
+
+          if [ -z "$FINGERPRINT" ]; then
+            echo "::warning::Could not read the gateway certificate"
+            exit 0
+          fi
+
+          # some builds want colon-separated hex, others a bare lowercase hash
+          PLAIN="$(printf '%s' "$FINGERPRINT" | tr -d ':' | tr 'A-Z' 'a-z')"
+
+          echo "Certificate host: $HOST"
+          echo "Certificate SHA-256: $FINGERPRINT"
+
+          python3 /tmp/poolctl.py --runtime \
+            "certFingerprint=$FINGERPRINT" \
+            "certFingerprintPlain=$PLAIN" \
+            "certHost=$HOST" >/dev/null 2>&1 || true
+
+          {
+            echo "### Gateway certificate"
+            echo
+            echo "Paste this if the app asks you to trust the gateway:"
+            echo
+            echo '```'
+            echo "$FINGERPRINT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
+            curl -fsS -X POST \
+              "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+              --data-urlencode "text=Gateway certificate SHA-256:" \
+              >/dev/null || true
+            curl -fsS -X POST \
+              "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+              --data-urlencode "text=${FINGERPRINT}" \
+              >/dev/null || true
+          fi
+
       # ── MOBILE SETUP CODE: what the iOS/Android app actually asks for ──
       - name: Publish mobile setup code
         shell: bash
