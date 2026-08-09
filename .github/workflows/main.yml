@@ -1463,6 +1463,10 @@ jobs:
           # some builds want colon-separated hex, others a bare lowercase hash
           PLAIN="$(printf '%s' "$FINGERPRINT" | tr -d ':' | tr 'A-Z' 'a-z')"
 
+          # kept on disk so the setup-code generator can embed it in the payload
+          printf '%s' "$FINGERPRINT" > /tmp/certfp.txt
+          printf '%s' "$PLAIN" > /tmp/certfp-plain.txt
+
           echo "Certificate host: $HOST"
           echo "Certificate SHA-256: $FINGERPRINT"
 
@@ -1528,6 +1532,50 @@ jobs:
             echo "::warning::openclaw qr returned no setup code"
             tail -n 5 /tmp/qr-err.log 2>/dev/null || true
             exit 1
+          fi
+
+          # openclaw qr does not embed the TLS fingerprint, so the app falls
+          # back to asking the human. decode the payload, add the fingerprint,
+          # re-encode: now one scan carries the trust decision too.
+          if [ -s /tmp/certfp.txt ]; then
+            ENRICHED="$(
+              CODE="$CODE" \
+              FP="$(cat /tmp/certfp.txt)" \
+              FPP="$(cat /tmp/certfp-plain.txt 2>/dev/null || true)" \
+              python3 - <<'PYFP'
+          import base64, json, os
+
+          code = os.environ["CODE"]
+          pad = "=" * (-len(code) % 4)
+          data = None
+
+          for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+              try:
+                  candidate = json.loads(decoder(code + pad))
+              except Exception:
+                  continue
+              if isinstance(candidate, dict):
+                  data = candidate
+                  break
+
+          if data is None:
+              print("")
+          else:
+              # both spellings: builds differ on which one they read
+              data["tlsFingerprint"] = os.environ.get("FP", "")
+              if os.environ.get("FPP"):
+                  data["tlsSha256"] = os.environ["FPP"]
+              blob = json.dumps(data, separators=(",", ":")).encode()
+              print(base64.b64encode(blob).decode())
+          PYFP
+            )"
+
+            if [ -n "$ENRICHED" ]; then
+              CODE="$ENRICHED"
+              echo "certificate fingerprint embedded in the setup code"
+            else
+              echo "setup code payload is not decodable json, left as-is"
+            fi
           fi
 
           echo "::add-mask::$CODE"
