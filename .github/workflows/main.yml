@@ -88,9 +88,15 @@ jobs:
 
           KEYS = ["OPENCLAW_GATEWAY_TOKEN", "NVIDIA_KEYS", "MISTRAL_KEYS",
                   "DATA_REPO", "DATA_REPO_TOKEN", "TELEGRAM_BOT_TOKEN",
-                  "TELEGRAM_USER_ID", "TELEGRAM_OWNER_ID", "RUN_HOURS"]
+                  "TELEGRAM_USER_ID", "TELEGRAM_OWNER_ID", "RUN_HOURS",
+                  # optional: pin OpenClaw to a known-good version
+                  "OPENCLAW_VERSION",
+                  # optional: permanent public address via Tailscale Funnel
+                  "TAILSCALE_AUTHKEY", "TAILSCALE_API_KEY",
+                  "TAILSCALE_HOSTNAME", "TAILSCALE_TAILNET"]
           SECRET = {"OPENCLAW_GATEWAY_TOKEN", "NVIDIA_KEYS", "MISTRAL_KEYS",
-                    "DATA_REPO_TOKEN", "TELEGRAM_BOT_TOKEN"}
+                    "DATA_REPO_TOKEN", "TELEGRAM_BOT_TOKEN",
+                    "TAILSCALE_AUTHKEY", "TAILSCALE_API_KEY"}
 
           values, loaded = {}, []
           for k in KEYS:
@@ -266,8 +272,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
-            npm install --global openclaw@latest
+          # Empty OPENCLAW_VERSION in Firebase = always install the newest
+          # release. Put an exact version there (e.g. 1.4.2) to freeze the
+          # runtime when an upstream update breaks the job.
+          OC_VERSION="$(printf '%s' "${OPENCLAW_VERSION:-}" | tr -d ' \r')"
+          [ -z "$OC_VERSION" ] && OC_VERSION="latest"
+          echo "Installing openclaw@${OC_VERSION}"
+
+          if ! SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
+               npm install --global "openclaw@${OC_VERSION}"; then
+            if [ "$OC_VERSION" = "latest" ]; then
+              echo "::error::Installing openclaw@latest failed"
+              exit 1
+            fi
+            echo "::warning::openclaw@${OC_VERSION} could not be installed - falling back to latest"
+            SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install --global openclaw@latest
+          fi
 
           openclaw --version
 
@@ -786,11 +806,13 @@ jobs:
           print("restored pool:", [x["id"] for x in pool] or "EMPTY (waiting for site selection)")
           PY
 
-      - name: Install Cloudflare Tunnel
+      - name: Install tunnel clients
         shell: bash
         run: |
           set -euo pipefail
 
+          # cloudflared is always installed: it is the fallback whenever
+          # Tailscale Funnel is not configured or fails to come up.
           curl --fail --location --silent --show-error \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             --output "$RUNNER_TEMP/cloudflared"
@@ -798,6 +820,17 @@ jobs:
           chmod +x "$RUNNER_TEMP/cloudflared"
           sudo mv "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
           cloudflared --version
+
+          # Tailscale gives a PERMANENT https address, so the phone never has
+          # to be re-paired. Funnel mode = public, no Tailscale app needed on
+          # any client device.
+          if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+            curl --fail --location --silent --show-error \
+              https://tailscale.com/install.sh | sudo sh
+            tailscale --version
+          else
+            echo "TAILSCALE_AUTHKEY not set - will use a random trycloudflare URL"
+          fi
 
       # ─────────────────────────────────────────────────────────────
       # 3. VALIDATE KEYS, START THE LITELLM ROUTER
@@ -1144,10 +1177,168 @@ jobs:
           DEVICE_APPROVER_PID=$!
           echo "DEVICE_APPROVER_PID=$DEVICE_APPROVER_PID" >> "$GITHUB_ENV"
 
-      - name: Start Cloudflare Tunnel
+      # ─────────────────────────────────────────────────────────────
+      #    PERMANENT PUBLIC ADDRESS (Tailscale Funnel)
+      #    Funnel publishes the gateway on https://<host>.<tailnet>.ts.net,
+      #    reachable from ANY device with NO Tailscale app installed, and the
+      #    address never changes. Pair the phone once and never again.
+      #    Skipped silently when TAILSCALE_AUTHKEY is not configured.
+      # ─────────────────────────────────────────────────────────────
+      - name: Start Tailscale Funnel
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "TAILSCALE_AUTHKEY not set - using a random trycloudflare URL"
+            exit 0
+          fi
+
+          TS_API="https://api.tailscale.com/api/v2"
+          TG_API="https://api.telegram.org"
+          TS_HOST="${TAILSCALE_HOSTNAME:-openclaw-runner}"
+          TS_SOCK="/var/run/tailscale/tailscaled.sock"
+
+          # A leftover node holding the same hostname would push this run to
+          # openclaw-runner-1.ts.net and defeat the whole point of a fixed
+          # address. Ephemeral auth keys self-clean; this is belt and braces.
+          if [ -n "${TAILSCALE_API_KEY:-}" ]; then
+            TS_NET="${TAILSCALE_TAILNET:--}"
+            DEVICES="$(curl -fsS -u "${TAILSCALE_API_KEY}:" \
+              "${TS_API}/tailnet/${TS_NET}/devices" || true)"
+            if [ -n "$DEVICES" ]; then
+              echo "$DEVICES" |
+                jq -r --arg h "$TS_HOST" \
+                  '.devices[]? | select((.hostname == $h) or ((.name // "") | startswith($h + "."))) | .id' |
+                while IFS= read -r ID; do
+                  [ -n "$ID" ] || continue
+                  echo "removing stale tailscale node $ID ($TS_HOST)"
+                  curl -fsS -X DELETE -u "${TAILSCALE_API_KEY}:" \
+                    "${TS_API}/device/${ID}" >/dev/null || true
+                done
+            else
+              echo "::warning::Tailscale API listing failed - continuing anyway"
+            fi
+          fi
+
+          sudo mkdir -p /var/lib/tailscale /var/run/tailscale
+
+          # userspace networking: a GitHub runner has no TUN device
+          sudo nohup tailscaled \
+            --state=/var/lib/tailscale/tailscaled.state \
+            --socket="$TS_SOCK" \
+            --tun=userspace-networking \
+            > "$RUNNER_TEMP/tailscaled.log" 2>&1 &
+
+          for attempt in $(seq 1 30); do
+            [ -S "$TS_SOCK" ] && break
+            sleep 1
+          done
+
+          if ! sudo tailscale --socket="$TS_SOCK" up \
+               --authkey="${TAILSCALE_AUTHKEY}" \
+               --hostname="$TS_HOST" \
+               --accept-dns=false \
+               --ssh=false \
+               --reset > "$RUNNER_TEMP/tailscale-up.log" 2>&1; then
+            echo "::warning::tailscale up failed - check the auth key is valid and reusable"
+            cat "$RUNNER_TEMP/tailscale-up.log" || true
+            exit 0
+          fi
+
+          DNS_NAME="$(sudo tailscale --socket="$TS_SOCK" status --json |
+            jq -r '.Self.DNSName // empty' | sed 's/\.$//')"
+          echo "tailnet address: ${DNS_NAME:-unknown}"
+
+          if [ -z "$DNS_NAME" ]; then
+            echo "::warning::Could not read the tailnet DNS name"
+            exit 0
+          fi
+
+          # publish on 443; two CLI generations are accepted
+          if ! sudo tailscale --socket="$TS_SOCK" funnel --bg --https=443 \
+                 http://127.0.0.1:18789 > "$RUNNER_TEMP/funnel.log" 2>&1 &&
+             ! sudo tailscale --socket="$TS_SOCK" funnel --bg 18789 \
+                 >> "$RUNNER_TEMP/funnel.log" 2>&1; then
+            echo "::warning::Funnel refused to start - enable HTTPS certificates and Funnel in the Tailscale admin console, then re-run"
+            cat "$RUNNER_TEMP/funnel.log" || true
+            sudo tailscale --socket="$TS_SOCK" logout >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          sudo tailscale --socket="$TS_SOCK" funnel status || true
+
+          TUNNEL_URL="https://$DNS_NAME"
+          WEBSOCKET_URL="wss://$DNS_NAME"
+
+          {
+            echo "TUNNEL_URL=$TUNNEL_URL"
+            echo "WEBSOCKET_URL=$WEBSOCKET_URL"
+            echo "TUNNEL_KIND=tailscale-funnel"
+            echo "TAILSCALE_ACTIVE=1"
+          } >> "$GITHUB_ENV"
+
+          # the certificate is issued on first request, so allow some time
+          for attempt in $(seq 1 45); do
+            if curl -fsS -m 15 -o /dev/null "$TUNNEL_URL"; then
+              echo "public address is answering: $TUNNEL_URL"
+              break
+            fi
+            sleep 2
+          done
+
+          POOL_LIST="$(python3 -c "
+          import json, os
+          p = os.path.join(os.environ['OPENCLAW_HOME'], 'pool.json')
+          try: pool = json.load(open(p))
+          except Exception: pool = []
+          print(', '.join(x['id'] for x in pool) or 'none')
+          ")"
+
+          {
+            echo "## OpenClaw Gateway"
+            echo
+            echo "Dashboard: $TUNNEL_URL"
+            echo
+            echo "WebSocket: $WEBSOCKET_URL"
+            echo
+            echo "Address: permanent (Tailscale Funnel) - pair the app once, it never changes"
+            echo
+            echo "Rotating pool: \`$POOL_LIST\`"
+            echo
+            echo "Router: LiteLLM \`pool-auto\` (NVIDIA NIM + Mistral, all keys rotated)"
+            echo
+            echo "Browser: Camoufox (anti-detect)"
+            echo
+            echo "Backup: hot every 5 min, full every 15 min, final on exit"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=OpenClaw Gateway (permanent)::$TUNNEL_URL"
+
+          python3 /tmp/poolctl.py --runtime \
+            "gatewayUrl=$TUNNEL_URL" "websocketUrl=$WEBSOCKET_URL" \
+            "tunnel=tailscale-funnel" "permanent=true" \
+            "startedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "state=online" || true
+
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
+            curl -fsS -X POST \
+              "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+              --data-urlencode "text=OpenClaw is online (permanent address)%0A${TUNNEL_URL}%0A${WEBSOCKET_URL}%0APool: ${POOL_LIST}" \
+              >/dev/null || true
+          fi
+
+      - name: Start fallback tunnel (Cloudflare)
         shell: bash
         run: |
           set -euo pipefail
+
+          # skipped entirely when Tailscale Funnel already gave us a permanent
+          # address earlier in the job
+          if [ -n "${TUNNEL_URL:-}" ]; then
+            echo "Permanent address already active: $TUNNEL_URL"
+            exit 0
+          fi
 
           nohup cloudflared tunnel \
             --no-autoupdate \
@@ -1411,6 +1602,14 @@ jobs:
         run: |
           [ -f /tmp/save.env ] && . /tmp/save.env || true
           export OPENCLAW_HOME="${OPENCLAW_HOME:-/home/runner/.openclaw}"
+
+          # release the fixed Tailscale hostname so the NEXT run reclaims the
+          # exact same ts.net address instead of getting a "-1" suffix
+          if [ "${TAILSCALE_ACTIVE:-}" = "1" ]; then
+            sudo tailscale --socket=/var/run/tailscale/tailscaled.sock logout \
+              >/dev/null 2>&1 || true
+          fi
+
           if [ -x /tmp/hotsave.sh ]; then
             /tmp/hotsave.sh || echo "::warning::hot save failed"
           else
@@ -1437,6 +1636,10 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          echo "===== Tailscale ====="
+          cat "$RUNNER_TEMP/tailscaled.log" 2>/dev/null || echo "not used"
+          cat "$RUNNER_TEMP/tailscale-up.log" 2>/dev/null || true
+          cat "$RUNNER_TEMP/funnel.log" 2>/dev/null || true
           echo "===== LiteLLM router ====="
           docker logs --tail 120 litellm 2>&1 || true
 
