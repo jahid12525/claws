@@ -1149,22 +1149,34 @@ jobs:
           set -euo pipefail
 
           cat > "$RUNNER_TEMP/approve-devices.sh" <<'SCRIPT'
-          #!/usr/bin/env bash
+          # Two separate approval stores have to be watched:
+          #   1. device pairing  -> gates the WebSocket connect handshake
+          #   2. node pairing    -> gates phone capabilities (camera, canvas, ...)
+          # The mobile app asks for both, so approve both.
+
+          UUID_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 
           while true; do
             OUTPUT="$(openclaw devices list 2>/dev/null || true)"
-
-            while IFS= read -r DEVICE_ID; do
-              [ -n "$DEVICE_ID" ] || continue
-              echo "Approving device: $DEVICE_ID"
-              openclaw devices approve "$DEVICE_ID" || true
-            done < <(
+            for DEVICE_ID in $(
               printf '%s\n' "$OUTPUT" |
                 grep -iE 'pending|pair|request' |
-                grep -oE \
-                  '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' |
+                grep -oE "$UUID_RE" |
                 sort -u || true
-            )
+            ); do
+              echo "Approving device: $DEVICE_ID"
+              openclaw devices approve "$DEVICE_ID" || true
+            done
+
+            # gateway-owned node pairing: "openclaw nodes pending" lists only
+            # requests waiting for approval, so every id found here is fair game
+            NODES="$(openclaw nodes pending 2>/dev/null || true)"
+            for NODE_ID in $(
+              printf '%s\n' "$NODES" | grep -oE "$UUID_RE" | sort -u || true
+            ); do
+              echo "Approving node: $NODE_ID"
+              openclaw nodes approve "$NODE_ID" || true
+            done
 
             sleep 3
           done
@@ -1172,7 +1184,7 @@ jobs:
 
           chmod +x "$RUNNER_TEMP/approve-devices.sh"
 
-          nohup "$RUNNER_TEMP/approve-devices.sh" \
+          nohup bash "$RUNNER_TEMP/approve-devices.sh" \
             > "$RUNNER_TEMP/device-approver.log" 2>&1 &
           DEVICE_APPROVER_PID=$!
           echo "DEVICE_APPROVER_PID=$DEVICE_APPROVER_PID" >> "$GITHUB_ENV"
@@ -1410,6 +1422,93 @@ jobs:
       #    full save (everything)   every 15 min  -> `backup` branch
       #    both survive cancels; final push goes to `main`
       # ─────────────────────────────────────────────────────────────
+      # ── MOBILE SETUP CODE: what the iOS/Android app actually asks for ──
+      - name: Publish mobile setup code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBSOCKET_URL:-}" ]; then
+            echo "::warning::No public address available, skipping setup code"
+            exit 0
+          fi
+
+          # one-shot generator: asks the gateway for a fresh pairing payload and
+          # pushes it to runtime/<uid> so the config site can render it
+          cat > /tmp/setupcode-once.sh <<'ONCEEOF'
+          set -uo pipefail
+
+          CODE=""
+          if OUT="$(openclaw qr --json --url "$WEBSOCKET_URL" 2>/tmp/qr-err.log)"; then
+            CODE="$(printf '%s' "$OUT" \
+              | jq -r '.setupCode // .setup_code // .code // .payload // empty' \
+              2>/dev/null || true)"
+          fi
+
+          if [ -z "$CODE" ]; then
+            CODE="$(openclaw qr --setup-code-only --url "$WEBSOCKET_URL" \
+              2>>/tmp/qr-err.log | tr -d ' \r\n' || true)"
+          fi
+
+          if [ -z "$CODE" ]; then
+            echo "::warning::openclaw qr returned no setup code"
+            tail -n 5 /tmp/qr-err.log 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "::add-mask::$CODE"
+          printf '%s' "$CODE" > /tmp/setupcode.txt
+          chmod 600 /tmp/setupcode.txt
+
+          python3 /tmp/poolctl.py --runtime \
+            "setupCode=$CODE" \
+            "setupCodeAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "setupCodeTtl=600" >/dev/null 2>&1 || true
+
+          echo "setup code published (${#CODE} chars) at $(date -u +%H:%M:%SZ)"
+          ONCEEOF
+
+          # the gateway expires every bootstrap token after 10 minutes, so keep a
+          # fresh one in Firebase for as long as the run lasts
+          cat > /tmp/setupcode-loop.sh <<'LOOPEOF'
+          while true; do
+            sleep 300
+            bash /tmp/setupcode-once.sh || true
+          done
+          LOOPEOF
+
+          if bash /tmp/setupcode-once.sh; then
+            CODE="$(cat /tmp/setupcode.txt)"
+            echo "::add-mask::$CODE"
+
+            {
+              echo "### Mobile pairing"
+              echo
+              echo "Open the config site, go to **Models -> Pair mobile**, then scan"
+              echo "the QR code or paste the setup code into the app under"
+              echo "**Settings -> Gateway**. The code is refreshed every 5 minutes."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ]; then
+              curl -fsS -X POST \
+                "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+                --data-urlencode "text=OpenClaw mobile setup code (valid 10 minutes):" \
+                >/dev/null || true
+              curl -fsS -X POST \
+                "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_USER_ID}" \
+                --data-urlencode "text=${CODE}" \
+                >/dev/null || true
+            fi
+          else
+            echo "::warning::First setup code failed, the refresh loop will retry"
+          fi
+
+          setsid nohup bash /tmp/setupcode-loop.sh \
+            > "$RUNNER_TEMP/setupcode.log" 2>&1 < /dev/null &
+          echo "SETUPCODE_PID=$!" >> "$GITHUB_ENV"
+
       - name: Start backup loop
         shell: bash
         run: |
@@ -1652,6 +1751,9 @@ jobs:
           cat "$RUNNER_TEMP/tailscaled.log" 2>/dev/null || echo "not used"
           cat "$RUNNER_TEMP/tailscale-up.log" 2>/dev/null || true
           cat "$RUNNER_TEMP/funnel.log" 2>/dev/null || true
+          echo "===== Mobile setup code ====="
+          cat "$RUNNER_TEMP/setupcode.log" 2>/dev/null || echo "not used"
+          tail -n 5 /tmp/qr-err.log 2>/dev/null || true
           echo "===== LiteLLM router ====="
           docker logs --tail 120 litellm 2>&1 || true
 
