@@ -284,8 +284,31 @@ jobs:
           mkdir -p "$CAMOFOX_DIR"
           cd "$CAMOFOX_DIR"
 
-          pnpm init >/dev/null 2>&1 || true
+          # pnpm 10+ refuses to run install scripts unless the package is
+          # explicitly approved, and exits 1 with ERR_PNPM_IGNORED_BUILDS.
+          # camofox-browser and better-sqlite3 BOTH need their build scripts,
+          # so pre-approve them in package.json instead of "pnpm approve-builds"
+          # (which is interactive and cannot run on a runner).
+          cat > package.json <<'JSON'
+          {
+            "name": "camofox-host",
+            "private": true,
+            "version": "1.0.0",
+            "pnpm": {
+              "onlyBuiltDependencies": [
+                "@askjo/camofox-browser",
+                "better-sqlite3",
+                "impit"
+              ]
+            }
+          }
+          JSON
+
           pnpm add @askjo/camofox-browser
+
+          # Belt and braces: if this pnpm build still skipped the scripts,
+          # run them explicitly so the Camoufox binary is actually fetched.
+          pnpm rebuild @askjo/camofox-browser better-sqlite3 || true
 
           echo "CAMOFOX_DIR=$CAMOFOX_DIR" >> "$GITHUB_ENV"
           echo "$CAMOFOX_DIR/node_modules/.bin" >> "$GITHUB_PATH"
