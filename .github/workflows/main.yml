@@ -1557,17 +1557,29 @@ jobs:
           HOURS="${RUN_HOURS_FINAL:-6}"
           END_TIME=$((SECONDS + HOURS * 3600))
 
-          echo "Gateway: $TUNNEL_URL"
+          echo "Gateway: ${TUNNEL_URL:-unavailable}"
+          echo "Tunnel: ${TUNNEL_KIND:-unknown}"
           echo "Model pool: managed from your Firebase config site"
           echo "Keeping gateway active for $HOURS hour(s)"
 
+          # Only watch processes that were actually started. The Cloudflare
+          # fallback is skipped whenever Tailscale Funnel already gave us a URL,
+          # so CLOUDFLARED_PID can legitimately be unset.
+          WATCH_PIDS=""
+          for CANDIDATE in \
+            "${OPENCLAW_PID:-}" \
+            "${DEVICE_APPROVER_PID:-}" \
+            "${CLOUDFLARED_PID:-}" \
+            "${CAMOFOX_PID:-}"
+          do
+            if [ -n "$CANDIDATE" ]; then
+              WATCH_PIDS="$WATCH_PIDS $CANDIDATE"
+            fi
+          done
+          echo "Watching pids:${WATCH_PIDS:- none}"
+
           while (( SECONDS < END_TIME )); do
-            for PROCESS_ID in \
-              "$OPENCLAW_PID" \
-              "$DEVICE_APPROVER_PID" \
-              "$CLOUDFLARED_PID" \
-              "$CAMOFOX_PID"
-            do
+            for PROCESS_ID in $WATCH_PIDS; do
               if ! kill -0 "$PROCESS_ID" 2>/dev/null; then
                 echo "::error::A required process stopped"
                 exit 1
