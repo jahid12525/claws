@@ -1428,6 +1428,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          TG_API="https://api.telegram.org"
+
           if [ -z "${WEBSOCKET_URL:-}" ]; then
             echo "::warning::No public address available, skipping setup code"
             exit 0
