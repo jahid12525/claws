@@ -287,8 +287,12 @@ jobs:
           # pnpm 10+ refuses to run install scripts unless the package is
           # explicitly approved, and exits 1 with ERR_PNPM_IGNORED_BUILDS.
           # camofox-browser and better-sqlite3 BOTH need their build scripts,
-          # so pre-approve them in package.json instead of "pnpm approve-builds"
-          # (which is interactive and cannot run on a runner).
+          # and "pnpm approve-builds" is interactive so it cannot run here.
+          #
+          # pnpm 11 stopped reading the "pnpm" field in package.json: the
+          # setting now lives in pnpm-workspace.yaml. Write BOTH so this works
+          # on pnpm 10 and 11, and disable strict-dep-builds so a skipped
+          # script can never fail the whole job again.
           cat > package.json <<'JSON'
           {
             "name": "camofox-host",
@@ -303,6 +307,18 @@ jobs:
             }
           }
           JSON
+
+          cat > pnpm-workspace.yaml <<'YML'
+          onlyBuiltDependencies:
+            - "@askjo/camofox-browser"
+            - better-sqlite3
+            - impit
+          strictDepBuilds: false
+          YML
+
+          cat > .npmrc <<'NPMRC'
+          strict-dep-builds=false
+          NPMRC
 
           pnpm add @askjo/camofox-browser
 
