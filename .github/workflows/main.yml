@@ -1,0 +1,1392 @@
+name: Deploy OpenClaw Gateway (NVIDIA + Mistral Pool + Full Backup)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Keep-alive hours 1-6 (leave empty to use RUN_HOURS from Firebase)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-openclaw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+
+    env:
+      OPENCLAW_FALLBACK_SKIP_TTL_MS: "60000"
+      OPENCLAW_HOME: /home/runner/.openclaw
+      # Every credential (gateway token, NVIDIA / Mistral keys,
+      # data repo + token, Telegram values) is pulled from your Firebase
+      # Realtime Database by the first step and exported to the whole job.
+      # Only the 4 FIREBASE_* bootstrap secrets live in GitHub.
+
+    steps:
+      # ─────────────────────────────────────────────────────────────
+      # 0. LOAD CONFIG FROM FIREBASE REALTIME DATABASE
+      #    Signs in with the vault account, reads secrets/<uid>, masks every
+      #    value in the log and exports them to the rest of the job.
+      # ─────────────────────────────────────────────────────────────
+      - name: Load configuration from Firebase
+        shell: bash
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_EMAIL: ${{ secrets.FIREBASE_EMAIL }}
+          FIREBASE_PASSWORD: ${{ secrets.FIREBASE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+
+          api = os.environ.get("FIREBASE_API_KEY", "").strip()
+          url = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
+          email = os.environ.get("FIREBASE_EMAIL", "").strip()
+          pw = os.environ.get("FIREBASE_PASSWORD", "")
+
+          if not (api and url and email and pw):
+              print("::error::Set FIREBASE_API_KEY, FIREBASE_DB_URL, FIREBASE_EMAIL and "
+                    "FIREBASE_PASSWORD in repository secrets")
+              sys.exit(1)
+
+          def fail(prefix, err):
+              try:
+                  detail = err.read().decode()[:300]
+              except Exception:
+                  detail = str(err)
+              print("::error::%s: %s" % (prefix, detail))
+              sys.exit(1)
+
+          # 1. sign in as the vault account (Email/Password provider)
+          signin = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + api
+          body = json.dumps({"email": email, "password": pw, "returnSecureToken": True}).encode()
+          req = urllib.request.Request(signin, data=body,
+                                      headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  tok = json.load(r)
+          except urllib.error.HTTPError as e:
+              fail("Firebase sign-in failed", e)
+          except Exception as e:
+              print("::error::Firebase sign-in failed: " + str(e)); sys.exit(1)
+
+          uid, id_token = tok["localId"], tok["idToken"]
+
+          # 2. read this account's own node (database rules keep it private)
+          node = url + "/secrets/" + uid + ".json?auth=" + id_token
+          try:
+              with urllib.request.urlopen(node, timeout=30) as r:
+                  data = json.load(r) or {}
+          except urllib.error.HTTPError as e:
+              fail("Reading secrets/" + uid + " failed (check database rules)", e)
+          except Exception as e:
+              print("::error::Reading config failed: " + str(e)); sys.exit(1)
+
+          KEYS = ["OPENCLAW_GATEWAY_TOKEN", "NVIDIA_KEYS", "MISTRAL_KEYS",
+                  "DATA_REPO", "DATA_REPO_TOKEN", "TELEGRAM_BOT_TOKEN",
+                  "TELEGRAM_USER_ID", "TELEGRAM_OWNER_ID", "RUN_HOURS"]
+          SECRET = {"OPENCLAW_GATEWAY_TOKEN", "NVIDIA_KEYS", "MISTRAL_KEYS",
+                    "DATA_REPO_TOKEN", "TELEGRAM_BOT_TOKEN"}
+
+          values, loaded = {}, []
+          for k in KEYS:
+              v = str(data.get(k) or "").strip()
+              if v:
+                  values[k] = v
+                  loaded.append(k)
+
+          # 3. mask every secret line BEFORE it can reach the log
+          for k in SECRET:
+              for line in values.get(k, "").splitlines():
+                  line = line.strip()
+                  if len(line) > 3:
+                      print("::add-mask::" + line)
+
+          def nkeys(k):
+              return len([x for x in values.get(k, "").replace(",", "\n").splitlines() if x.strip()])
+
+          if not values.get("OPENCLAW_GATEWAY_TOKEN"):
+              print("::error::OPENCLAW_GATEWAY_TOKEN is empty in Firebase - set it on the config site")
+              sys.exit(1)
+          if nkeys("NVIDIA_KEYS") == 0 and nkeys("MISTRAL_KEYS") == 0:
+              print("::error::No NVIDIA or Mistral keys stored in Firebase")
+              sys.exit(1)
+
+          # 4. export to the rest of the job (heredoc form handles multi-line keys)
+          print("::add-mask::" + pw)
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              for k, v in values.items():
+                  d = "FBEOF_" + k
+                  fh.write("%s<<%s\n%s\n%s\n" % (k, d, v, d))
+              # the pool controller reuses the same Firebase session later on
+              fh.write("FIREBASE_API_KEY=%s\n" % api)
+              fh.write("FIREBASE_DB_URL=%s\n" % url)
+              fh.write("FIREBASE_EMAIL=%s\n" % email)
+              fh.write("FIREBASE_PASSWORD=%s\n" % pw)
+              fh.write("FB_UID=%s\n" % uid)
+
+          print("Config loaded from Firebase for uid %s" % uid)
+          print("  fields: " + ", ".join(loaded))
+          print("  NVIDIA keys: %d | Mistral keys: %d" % (nkeys("NVIDIA_KEYS"), nkeys("MISTRAL_KEYS")))
+          print("  data repo: " + (values.get("DATA_REPO") or "NOT SET - backups disabled"))
+          PY
+
+      # ─────────────────────────────────────────────────────────────
+      # 1. RESTORE ALL DATA FROM THE PRIVATE STORAGE REPO
+      #    main   = final save at end of every run
+      #    backup = full save every 15 min
+      #    hot    = critical save every 5 min + emergency save on cancel
+      #    The newest of the three wins, overlaid in order.
+      # ─────────────────────────────────────────────────────────────
+      - name: Restore data from backup repo
+        shell: bash
+        run: |
+          date +%s > /tmp/job_start
+          mkdir -p "$OPENCLAW_HOME"
+
+          if [ -z "${DATA_REPO:-}" ] || [ -z "${DATA_REPO_TOKEN:-}" ]; then
+            echo "::warning::DATA_REPO / DATA_REPO_TOKEN not set - running WITHOUT persistence"
+            exit 0
+          fi
+
+          REPO_URL="https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git"
+
+          git clone --depth 1 "$REPO_URL" /tmp/data 2>/dev/null || true
+
+          # backup branch (15-min full saves) - newer than main if last run crashed
+          git clone --depth 1 -b backup "$REPO_URL" /tmp/databk 2>/dev/null || true
+          if [ -d /tmp/databk/.git ] && [ -d /tmp/data/.git ]; then
+            MAIN_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+            BK_TS=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$BK_TS" -gt "$MAIN_TS" ]; then
+              echo "backup branch is newer - overlaying onto main restore"
+              rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
+            fi
+          elif [ -d /tmp/databk/.git ]; then
+            mkdir -p /tmp/data
+            rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
+          fi
+
+          # hot branch (5-min critical saves) - almost always the freshest
+          git clone --depth 1 -b hot "$REPO_URL" /tmp/datahot 2>/dev/null || true
+          if [ -d /tmp/datahot/.git ] && [ -d /tmp/data/.git ]; then
+            CUR_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ -d /tmp/databk/.git ]; then
+              BK2=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0)
+            else
+              BK2=0
+            fi
+            [ "$BK2" -gt "$CUR_TS" ] && CUR_TS=$BK2
+            HOT_TS=$(git -C /tmp/datahot log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$HOT_TS" -ge "$CUR_TS" ]; then
+              echo "hot branch is freshest - overlaying agents/sessions/memory"
+              rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+            fi
+          elif [ -d /tmp/datahot/.git ]; then
+            mkdir -p /tmp/data
+            rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+          fi
+
+          if [ -d /tmp/data ]; then
+            # never restore a stale secrets file - it is rewritten each run
+            rm -f /tmp/data/openclaw.json /tmp/data/.env
+            rsync -a --exclude='.git' /tmp/data/ "$OPENCLAW_HOME/" || true
+
+            # reassemble files that were split for GitHub's 100MB limit
+            find "$OPENCLAW_HOME" -name "*.gh-chunk.000" | while read -r first; do
+              base="${first%.gh-chunk.000}"
+              cat "${base}".gh-chunk.* > "$base"
+              rm -f "${base}".gh-chunk.*
+              echo "Reassembled: $base"
+            done
+          fi
+
+          # put restored OUTSIDE-tree state back where OpenClaw expects it
+          for pair in "config:.config" "share:.local/share" "state:.local/state"; do
+            srcd="$OPENCLAW_HOME/xdg-mirror/${pair%%:*}"
+            dstd="$HOME/${pair##*:}"
+            if [ -d "$srcd" ] && [ -n "$(ls -A "$srcd" 2>/dev/null)" ]; then
+              mkdir -p "$dstd"
+              rsync -a "$srcd/" "$dstd/"
+              echo "Restored $dstd from backup"
+            fi
+          done
+
+          echo "Restored tree:"
+          ls -la "$OPENCLAW_HOME" || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Validate configuration
+        shell: bash
+        env:
+          REQUESTED_HOURS: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+            echo "::error::Configure OPENCLAW_GATEWAY_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "${NVIDIA_KEYS:-}" ] && [ -z "${MISTRAL_KEYS:-}" ]; then
+            echo "::error::Configure NVIDIA_KEYS and/or MISTRAL_KEYS (one key per line, commas also OK)"
+            exit 1
+          fi
+
+          # workflow input wins; otherwise use RUN_HOURS from Firebase; else 6
+          HOURS="${REQUESTED_HOURS:-}"
+          [ -z "$HOURS" ] && HOURS="${RUN_HOURS:-}"
+          [ -z "$HOURS" ] && HOURS="6"
+          if ! [[ "$HOURS" =~ ^[1-6]$ ]]; then
+            echo "::error::Duration must be an integer from 1 to 6 (got '$HOURS')"
+            exit 1
+          fi
+          echo "RUN_HOURS_FINAL=$HOURS" >> "$GITHUB_ENV"
+          echo "Run duration: $HOURS hour(s)"
+
+          count_keys() {
+            printf '%s\n' "$1" | tr ',' '\n' | tr -d ' \r' | grep -c . || true
+          }
+          echo "NVIDIA keys provided: $(count_keys "${NVIDIA_KEYS:-}")"
+          echo "Mistral keys provided: $(count_keys "${MISTRAL_KEYS:-}")"
+
+      - name: Install OpenClaw
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
+            npm install --global openclaw@latest
+
+          openclaw --version
+
+      - name: Install Camoufox browser plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # camofox-browser's native dep "impit" enforces pnpm via an
+          # "only-allow pnpm" preinstall guard, so npm install always fails.
+          npm install --global pnpm
+
+          CAMOFOX_DIR="$HOME/camofox"
+          mkdir -p "$CAMOFOX_DIR"
+          cd "$CAMOFOX_DIR"
+
+          pnpm init >/dev/null 2>&1 || true
+          pnpm add @askjo/camofox-browser
+
+          echo "CAMOFOX_DIR=$CAMOFOX_DIR" >> "$GITHUB_ENV"
+          echo "$CAMOFOX_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+
+          openclaw plugins install @askjo/camofox-browser
+
+      # ──────────────────────────────────────────────────────────
+      # 2. FIREBASE MODEL POOL CONTROLLER (NVIDIA NIM + Mistral)
+      #    No local panel and no second tunnel. The runner publishes the live
+      #    catalogs to Firebase, you tick models on your config site, and this
+      #    controller rebuilds the rotating LiteLLM pool within ~20 seconds.
+      # ──────────────────────────────────────────────────────────
+      - name: Write Firebase model pool controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/poolctl.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Firebase-driven model pool controller for the OpenClaw runner.
+
+          Replaces the old Flask control panel. The static config site is now the only UI.
+
+            --publish   fetch NVIDIA/Mistral catalogs + probe pooled models -> catalog/<uid>
+            --wait      block until pool/<uid> holds at least one model (default 60 min)
+            --init      read pool, drop dead models, write /tmp/litellm.yaml
+            --watch     background loop: apply pool changes, re-publish catalog, heartbeat
+            --runtime   patch runtime/<uid> with values passed as key=value arguments
+          """
+
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          API_KEY = os.environ.get("FIREBASE_API_KEY", "").strip()
+          DB_URL = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
+          EMAIL = os.environ.get("FIREBASE_EMAIL", "").strip()
+          PASSWORD = os.environ.get("FIREBASE_PASSWORD", "")
+
+          HOME = os.environ.get("OPENCLAW_HOME", "/home/runner/.openclaw")
+          CACHE = os.path.join(HOME, "pool.json")
+          CFG = "/tmp/litellm.yaml"
+
+          PROVIDERS = {
+              "nvidia": {
+                  "base": "https://integrate.api.nvidia.com/v1",
+                  "prefix": "nvidia_nim",
+                  "env": "NVIDIA_KEY_",
+                  "rpm": 40,
+                  "tpm": 400000,
+              },
+              "mistral": {
+                  "base": "https://api.mistral.ai/v1",
+                  "prefix": "mistral",
+                  "env": "MISTRAL_KEY_",
+                  "rpm": 30,
+                  "tpm": 500000,
+              },
+          }
+
+          TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          TG_CHAT = os.environ.get("TELEGRAM_USER_ID", "")
+
+
+          def log(*a):
+              print(*a, flush=True)
+
+
+          def tg(text):
+              if not (TG_TOKEN and TG_CHAT):
+                  return
+              try:
+                  body = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
+                  urllib.request.urlopen(
+                      "https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN, body, timeout=15
+                  ).read()
+              except Exception:
+                  pass
+
+
+          # ---------------------------------------------------------------- http helpers
+          def http(url, data=None, method=None, headers=None, timeout=45):
+              hdr = {"Content-Type": "application/json"}
+              hdr.update(headers or {})
+              raw = json.dumps(data).encode() if data is not None else None
+              req = urllib.request.Request(url, data=raw, headers=hdr, method=method)
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  text = r.read().decode()
+              return json.loads(text) if text.strip() else None
+
+
+          _session = {"token": None, "uid": None, "expires": 0.0}
+
+
+          def auth():
+              """Sign in as the vault account. ID tokens last 1h, so refresh at 50 min."""
+              if _session["token"] and time.time() < _session["expires"]:
+                  return _session
+              if not (API_KEY and DB_URL and EMAIL and PASSWORD):
+                  raise SystemExit("::error::FIREBASE_* environment values are missing")
+              res = http(
+                  "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + API_KEY,
+                  {"email": EMAIL, "password": PASSWORD, "returnSecureToken": True},
+              )
+              _session.update(token=res["idToken"], uid=res["localId"], expires=time.time() + 3000)
+              return _session
+
+
+          def db(path, value=None, method="GET"):
+              s = auth()
+              url = "%s/%s.json?auth=%s" % (DB_URL, path.strip("/"), s["token"])
+              try:
+                  return http(url, data=value, method=None if method == "GET" else method)
+              except urllib.error.HTTPError as e:
+                  log("::warning::Firebase %s %s failed: %s" % (method, path, e.code))
+              except Exception as e:
+                  log("::warning::Firebase %s %s failed: %s" % (method, path, e))
+              return None
+
+
+          def uid():
+              return auth()["uid"]
+
+
+          # ------------------------------------------------------------------- providers
+          def keys_for(provider):
+              """Keys were split into NVIDIA_KEY_n / MISTRAL_KEY_n by the workflow."""
+              env = PROVIDERS[provider]["env"]
+              out, i = [], 1
+              while True:
+                  v = os.environ.get("%s%d" % (env, i))
+                  if not v:
+                      break
+                  out.append(v)
+                  i += 1
+              return out
+
+
+          def fetch_catalog(provider):
+              ks = keys_for(provider)
+              if not ks:
+                  return [], None
+              cfg = PROVIDERS[provider]
+              try:
+                  res = http(
+                      cfg["base"] + "/models",
+                      headers={"Authorization": "Bearer " + ks[0]},
+                      timeout=40,
+                  )
+              except Exception as e:
+                  return [], "%s catalog unavailable: %s" % (provider, e)
+              ids = sorted({m.get("id") for m in (res or {}).get("data", []) if m.get("id")})
+              return ids, None
+
+
+          def probe(provider, model):
+              """One-token completion. Returns (ok, detail)."""
+              ks = keys_for(provider)
+              if not ks:
+                  return False, "no key"
+              cfg = PROVIDERS[provider]
+              payload = {
+                  "model": model,
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "max_tokens": 1,
+                  "temperature": 0,
+              }
+              try:
+                  http(
+                      cfg["base"] + "/chat/completions",
+                      payload,
+                      headers={"Authorization": "Bearer " + ks[0]},
+                      timeout=60,
+                  )
+                  return True, "ok"
+              except urllib.error.HTTPError as e:
+                  # rate limiting means the model exists and works, just busy right now
+                  if e.code in (408, 429, 500, 502, 503, 504):
+                      return True, "busy (HTTP %d)" % e.code
+                  detail = ""
+                  try:
+                      detail = e.read().decode()[:160]
+                  except Exception:
+                      pass
+                  return False, "HTTP %d %s" % (e.code, detail)
+              except Exception as e:
+                  return False, str(e)[:160]
+
+
+          # ----------------------------------------------------------------------- pool
+          def normalise(items):
+              out, seen = [], set()
+              for it in items or []:
+                  if not isinstance(it, dict):
+                      continue
+                  mid = str(it.get("id") or "").strip()
+                  prov = str(it.get("provider") or "nvidia").strip()
+                  if not mid or prov not in PROVIDERS or mid in seen:
+                      continue
+                  seen.add(mid)
+                  out.append({"id": mid, "provider": prov})
+              return out
+
+
+          def read_pool():
+              node = db("pool/" + uid()) or {}
+              pool = normalise(node.get("models") if isinstance(node, dict) else node)
+              if pool:
+                  return pool, node.get("updatedAt") if isinstance(node, dict) else None
+              try:  # offline fallback: last pool restored from the backup repo
+                  with open(CACHE) as fh:
+                      return normalise(json.load(fh)), None
+              except Exception:
+                  return [], None
+
+
+          def cache_pool(pool):
+              os.makedirs(HOME, exist_ok=True)
+              with open(CACHE, "w") as fh:
+                  json.dump(pool, fh, indent=1)
+
+
+          def publish_pool(pool):
+              db("pool/" + uid(), {"models": pool, "updatedAt": int(time.time() * 1000)}, "PUT")
+
+
+          def prune(pool):
+              """Drop models the provider retired: absent from catalog AND failing a probe."""
+              live = {}
+              for prov in PROVIDERS:
+                  if any(it["provider"] == prov for it in pool):
+                      ids, _ = fetch_catalog(prov)
+                      live[prov] = set(ids)
+              kept, removed = [], []
+              for it in pool:
+                  known = live.get(it["provider"])
+                  if known and it["id"] in known:
+                      kept.append(it)
+                      continue
+                  ok, why = probe(it["provider"], it["id"])
+                  (kept if ok else removed).append(it if ok else (it, why))
+                  time.sleep(1.1)
+              return kept, removed
+
+
+          # --------------------------------------------------------------- litellm config
+          def write_config(pool):
+              lines = ["model_list:"]
+
+              def deployment(name, provider, model):
+                  cfg = PROVIDERS[provider]
+                  for i in range(1, len(keys_for(provider)) + 1):
+                      lines.append('  - model_name: "%s"' % name)
+                      lines.append("    litellm_params:")
+                      lines.append('      model: "%s/%s"' % (cfg["prefix"], model))
+                      lines.append("      api_key: os.environ/%s%d" % (cfg["env"], i))
+                      lines.append('      api_base: "%s"' % cfg["base"])
+                      lines.append("      rpm: %d" % cfg["rpm"])
+                      lines.append("      tpm: %d" % cfg["tpm"])
+
+              for it in pool:
+                  deployment(it["id"], it["provider"], it["id"])   # addressable by name
+                  deployment("pool-auto", it["provider"], it["id"])  # auto-rotating group
+
+              lines += [
+                  "",
+                  "router_settings:",
+                  "  routing_strategy: simple-shuffle",
+                  "  num_retries: 5",
+                  "  retry_after: 5",
+                  "  allowed_fails: 1",
+                  "  cooldown_time: 30",
+                  "  enable_pre_call_checks: true",
+                  "  timeout: 90",
+                  "  retry_policy:",
+                  "    BadRequestErrorRetries: 4",
+                  "    TimeoutErrorRetries: 5",
+                  "    RateLimitErrorRetries: 5",
+                  "    InternalServerErrorRetries: 5",
+                  "    ContentPolicyViolationErrorRetries: 2",
+                  "",
+                  "litellm_settings:",
+                  "  drop_params: true",
+                  "  request_timeout: 90",
+                  "",
+                  "general_settings:",
+                  "  global_max_parallel_requests: 100000",
+                  "",
+              ]
+              with open(CFG, "w") as fh:
+                  fh.write("\n".join(lines))
+              return len(pool)
+
+
+          def restart_router():
+              subprocess.run(
+                  ["docker", "restart", "-t", "2", "litellm"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  check=False,
+              )
+
+
+          # --------------------------------------------------------------------- commands
+          def cmd_publish(with_status=True):
+              payload = {"providers": {}, "errors": [], "fetchedAt": int(time.time() * 1000)}
+              for prov in PROVIDERS:
+                  ks = keys_for(prov)
+                  ids, err = fetch_catalog(prov)
+                  payload["providers"][prov] = {"models": ids, "keys": len(ks)}
+                  if err:
+                      payload["errors"].append(err)
+                  log("%s: %d models, %d keys" % (prov, len(ids), len(ks)))
+
+              if with_status:
+                  pool, _ = read_pool()
+                  status = {}
+                  for it in pool[:40]:  # keep the probe budget sane
+                      ok, why = probe(it["provider"], it["id"])
+                      status[it["id"].replace("/", "|")] = {"ok": ok, "detail": why}
+                      time.sleep(1.1)
+                  payload["status"] = status
+
+              db("catalog/" + uid(), payload, "PUT")
+              log("catalog published for uid %s" % uid())
+
+
+          def cmd_wait(minutes=60):
+              deadline = time.time() + minutes * 60
+              warned = False
+              while time.time() < deadline:
+                  pool, _ = read_pool()
+                  if pool:
+                      log("pool selected: %s" % ", ".join(x["id"] for x in pool))
+                      return 0
+                  if not warned:
+                      warned = True
+                      log("::warning::No model pool selected yet - pick models on your config site")
+                      tg("OpenClaw: no models selected yet. Open your config site, go to Models, "
+                         "tick the models you want and press Apply. Waiting up to %d min..." % minutes)
+                  time.sleep(15)
+              log("::error::No model pool selected within %d minutes" % minutes)
+              return 1
+
+
+          def cmd_init():
+              pool, _ = read_pool()
+              if not pool:
+                  return 3
+              kept, removed = prune(pool)
+              if removed:
+                  names = ", ".join(x[0]["id"] for x in removed)
+                  log("::warning::Removed retired models: %s" % names)
+                  tg("OpenClaw: these models are no longer usable and were removed from your "
+                     "pool: %s" % names)
+                  publish_pool(kept)
+              if not kept:
+                  return 3
+              cache_pool(kept)
+              write_config(kept)
+              log("router config built with %d model(s): %s"
+                  % (len(kept), ", ".join(x["id"] for x in kept)))
+              return 0
+
+
+          def cmd_runtime(pairs):
+              patch = {}
+              for p in pairs:
+                  if "=" in p:
+                      k, v = p.split("=", 1)
+                      patch[k.strip()] = v.strip()
+              patch["heartbeat"] = int(time.time() * 1000)
+              db("runtime/" + uid(), patch, "PATCH")
+
+
+          def cmd_watch():
+              """Apply pool edits from the site within ~20s; refresh catalog every 30 min."""
+              pool, _ = read_pool()
+              current = json.dumps(pool, sort_keys=True)
+              last_catalog = time.time()
+              cmd_runtime(["poolSize=%d" % len(pool), "state=running"])
+
+              while True:
+                  time.sleep(20)
+                  try:
+                      node = db("pool/" + uid()) or {}
+                      wanted = normalise(node.get("models") if isinstance(node, dict) else node)
+                      if wanted and json.dumps(wanted, sort_keys=True) != current:
+                          log("pool changed on the site -> %s" % ", ".join(x["id"] for x in wanted))
+                          write_config(wanted)
+                          cache_pool(wanted)
+                          restart_router()
+                          current = json.dumps(wanted, sort_keys=True)
+                          cmd_runtime(["poolSize=%d" % len(wanted), "state=reloaded"])
+                          tg("OpenClaw: router reloaded with %d model(s)" % len(wanted))
+
+                      if time.time() - last_catalog > 1800:
+                          last_catalog = time.time()
+                          cmd_publish()
+                          pool, _ = read_pool()
+                          kept, removed = prune(pool)
+                          if removed and kept:
+                              publish_pool(kept)
+                              write_config(kept)
+                              cache_pool(kept)
+                              restart_router()
+                              current = json.dumps(kept, sort_keys=True)
+                              tg("OpenClaw: pruned %d retired model(s), router reloaded"
+                                 % len(removed))
+                      else:
+                          cmd_runtime(["state=running"])
+                  except Exception as e:
+                      log("::warning::watch loop error: %s" % e)
+                      time.sleep(30)
+
+
+          def main():
+              args = sys.argv[1:]
+              mode = args[0] if args else "--init"
+              if mode == "--publish":
+                  cmd_publish()
+                  return 0
+              if mode == "--wait":
+                  return cmd_wait(int(args[1]) if len(args) > 1 else 60)
+              if mode == "--init":
+                  return cmd_init()
+              if mode == "--watch":
+                  cmd_watch()
+                  return 0
+              if mode == "--runtime":
+                  cmd_runtime(args[1:])
+                  return 0
+              log("unknown mode: %s" % mode)
+              return 2
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -c "import ast; ast.parse(open('/tmp/poolctl.py').read())"
+          echo "pool controller written ($(wc -l < /tmp/poolctl.py) lines)"
+
+          # drop anything unusable from the pool restored out of the backup repo
+          python3 - <<'PY'
+          import json, os
+          home = os.environ.get("OPENCLAW_HOME", "/home/runner/.openclaw")
+          p = os.path.join(home, "pool.json")
+          try:
+              pool = [x for x in json.load(open(p))
+                      if isinstance(x, dict) and x.get("provider") in ("nvidia", "mistral")]
+          except Exception:
+              pool = []
+          os.makedirs(home, exist_ok=True)
+          json.dump(pool, open(p, "w"), indent=1)
+          print("restored pool:", [x["id"] for x in pool] or "EMPTY (waiting for site selection)")
+          PY
+
+      - name: Install Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --silent --show-error \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output "$RUNNER_TEMP/cloudflared"
+
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          sudo mv "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
+          cloudflared --version
+
+      # ─────────────────────────────────────────────────────────────
+      # 3. VALIDATE KEYS, START THE LITELLM ROUTER
+      # ─────────────────────────────────────────────────────────────
+      - name: Start LiteLLM router
+        shell: bash
+        run: |
+          set -uo pipefail
+          TG_API="https://api.telegram.org"
+          tg() {
+            [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_USER_ID:-}" ] || return 0
+            curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" --data-urlencode text="$1" > /dev/null || true
+          }
+
+          : > /tmp/litellm.env
+          chmod 600 /tmp/litellm.env
+
+          # ── validate NVIDIA keys: 401/403 keys are dropped, never pooled ──
+          n=0; bad_n=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            echo "::add-mask::$k"
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://integrate.api.nvidia.com/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_n=$((bad_n+1))
+              echo "::warning::Dropping NVIDIA key #$((n+bad_n)) - auth failed (HTTP $code)"
+            else
+              n=$((n+1))
+              echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
+          done < <(printf '%s\n' "${NVIDIA_KEYS:-}" | tr ',' '\n')
+          echo "NVIDIA keys: $n valid, $bad_n dropped"
+          [ "$bad_n" -gt 0 ] && tg "OpenClaw: ${bad_n} NVIDIA key(s) dead - ${n} still working"
+
+          # ── validate Mistral keys (optional) ──
+          m=0; bad_m=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            echo "::add-mask::$k"
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://api.mistral.ai/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_m=$((bad_m+1))
+              echo "::warning::Dropping Mistral key #$((m+bad_m)) - auth failed (HTTP $code)"
+            else
+              m=$((m+1))
+              echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
+          done < <(printf '%s\n' "${MISTRAL_KEYS:-}" | tr ',' '\n')
+          echo "Mistral keys: $m valid, $bad_m dropped"
+          [ "$bad_m" -gt 0 ] && tg "OpenClaw: ${bad_m} Mistral key(s) dead - ${m} still working"
+
+          if [ "$n" -eq 0 ] && [ "$m" -eq 0 ]; then
+            echo "::error::No working NVIDIA or Mistral key survived the auth check"
+            exit 1
+          fi
+
+          set -a; source /tmp/litellm.env; set +a
+
+          # publish the live NVIDIA / Mistral catalogs for the config site
+          python3 /tmp/poolctl.py --publish > /tmp/poolctl-boot.log 2>&1 \
+            || { echo "::warning::Catalog publish failed"; tail -n 20 /tmp/poolctl-boot.log; }
+
+          # nothing is hardcoded: wait for YOUR selection when the pool is empty
+          if ! python3 /tmp/poolctl.py --init; then
+            python3 /tmp/poolctl.py --wait 60 \
+              || { echo "::error::No model pool selected within 60 minutes"; exit 1; }
+            python3 /tmp/poolctl.py --init \
+              || { echo "::error::Could not build a router config from your selection"; exit 1; }
+          fi
+
+          docker rm -f litellm 2>/dev/null || true
+          docker run -d --name litellm --network host \
+            --env-file /tmp/litellm.env \
+            -v /tmp/litellm.yaml:/app/config.yaml \
+            ghcr.io/berriai/litellm:main-stable \
+            --config /app/config.yaml --port 4000 --num_workers 4
+
+          rm -f /tmp/litellm.env   # keys now live only in container/process env
+
+          echo "Waiting for LiteLLM..."
+          for i in $(seq 1 40); do
+            curl -fs http://localhost:4000/v1/models >/dev/null 2>&1 && break
+            sleep 3
+          done
+          curl -fs http://localhost:4000/v1/models >/dev/null || { docker logs litellm; exit 1; }
+
+          # watcher: applies pool edits from the site in ~20s, prunes dead models
+          # every 30 min, republishes the catalog and heartbeats to Firebase
+          setsid nohup python3 /tmp/poolctl.py --watch > /tmp/poolctl.log 2>&1 < /dev/null &
+          POOLCTL_PID=$!
+          echo "POOLCTL_PID=$POOLCTL_PID" >> "$GITHUB_ENV"
+
+          echo "=================================================="
+          echo "Model pool is managed from your Firebase config site"
+          echo "Pool watcher pid: $POOLCTL_PID"
+          echo "=================================================="
+          echo "::notice title=Model pool::Managed from your config site (Models tab)"
+
+      - name: Generate Camoufox API key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CAMOFOX_API_KEY="$(openssl rand -hex 32)"
+          echo "::add-mask::${CAMOFOX_API_KEY}"
+          echo "CAMOFOX_API_KEY=${CAMOFOX_API_KEY}" >> "$GITHUB_ENV"
+
+      # ─────────────────────────────────────────────────────────────
+      # 4. CONFIGURE OPENCLAW AGAINST THE LOCAL POOL ROUTER
+      #    primary = litellm/pool-auto (rotates every model x every key)
+      #    fallbacks = each selected model by name
+      # ─────────────────────────────────────────────────────────────
+      - name: Configure OpenClaw
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$OPENCLAW_HOME"
+
+          # model id list from the pool you selected on the site
+          MODEL_IDS_JSON="$(python3 -c "
+          import json, os
+          p = os.path.join(os.environ['OPENCLAW_HOME'], 'pool.json')
+          try: pool = json.load(open(p))
+          except Exception: pool = []
+          print(json.dumps([x['id'] for x in pool]))
+          ")"
+          echo "Pool models: $MODEL_IDS_JSON"
+
+          OWNER_ID="${TELEGRAM_OWNER_ID:-680349125}"
+
+          jq -n \
+            --arg gatewayToken "$OPENCLAW_GATEWAY_TOKEN" \
+            --arg telegramToken "${TELEGRAM_BOT_TOKEN:-}" \
+            --argjson ids "$MODEL_IDS_JSON" \
+            --argjson owner "$OWNER_ID" \
+            '
+            ($ids | map("litellm/" + .)) as $named |
+            {
+              gateway: {
+                mode: "local",
+                bind: "loopback",
+                auth: { token: $gatewayToken },
+                controlUi: { dangerouslyAllowHostHeaderOriginFallback: true }
+              },
+              env: {
+                # local router; the real provider keys never reach OpenClaw
+                LITELLM_API_KEY: "sk-local-pool"
+              },
+              models: {
+                providers: {
+                  litellm: {
+                    baseUrl: "http://127.0.0.1:4000/v1",
+                    api: "openai-completions",
+                    apiKey: "sk-local-pool"
+                  }
+                }
+              },
+              agents: {
+                defaults: {
+                  model: {
+                    # pool-auto round-robins across ALL selected NVIDIA +
+                    # Mistral models x ALL API keys automatically
+                    primary: "litellm/pool-auto",
+                    fallbacks: $named
+                  },
+                  models: (
+                    (["litellm/pool-auto"] + $named)
+                    | map({ (.): {} }) | add
+                  )
+                }
+              },
+              commands: { ownerAllowFrom: [$owner] },
+              channels: (
+                if $telegramToken == "" then {}
+                else {
+                  telegram: {
+                    enabled: true,
+                    botToken: $telegramToken,
+                    dmPolicy: "allowlist",
+                    allowFrom: [$owner]
+                  }
+                }
+                end
+              ),
+              tools: {
+                profile: "full",
+                allow: ["*"],
+                web: {
+                  search: { enabled: true, provider: "duckduckgo" },
+                  fetch: { enabled: true }
+                }
+              },
+              messages: {
+                tts: { auto: "always", provider: "microsoft" }
+              }
+            }' > "$OPENCLAW_HOME/openclaw.json"
+
+          cat > "$OPENCLAW_HOME/exec-approvals.json" <<'EOF'
+          {
+            "version": 1,
+            "defaults": {
+              "security": "full",
+              "ask": "off",
+              "askFallback": "full"
+            }
+          }
+          EOF
+
+          chmod 600 \
+            "$OPENCLAW_HOME/openclaw.json" \
+            "$OPENCLAW_HOME/exec-approvals.json"
+
+          openclaw doctor
+
+      - name: Start Camoufox browser server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CAMOFOX_BIN="$CAMOFOX_DIR/node_modules/.bin/camofox-browser"
+          [ -x "$CAMOFOX_BIN" ] || CAMOFOX_BIN="$CAMOFOX_DIR/node_modules/.bin/camofox"
+
+          if [ ! -x "$CAMOFOX_BIN" ]; then
+            echo "::error::Camoufox binary not found in $CAMOFOX_DIR/node_modules/.bin"
+            ls -la "$CAMOFOX_DIR/node_modules/.bin" || true
+            exit 1
+          fi
+
+          nohup "$CAMOFOX_BIN" > "$RUNNER_TEMP/camofox.log" 2>&1 &
+          CAMOFOX_PID=$!
+          echo "CAMOFOX_PID=$CAMOFOX_PID" >> "$GITHUB_ENV"
+
+          for attempt in {1..150}; do
+            if curl --fail --silent http://127.0.0.1:9377/health >/dev/null; then
+              echo "Camoufox browser server is running"
+              exit 0
+            fi
+            if ! kill -0 "$CAMOFOX_PID" 2>/dev/null; then
+              echo "::error::Camoufox server exited unexpectedly"
+              cat "$RUNNER_TEMP/camofox.log"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "::error::Camoufox server failed to start"
+          cat "$RUNNER_TEMP/camofox.log"
+          exit 1
+
+      - name: Start OpenClaw Gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nohup openclaw gateway --port 18789 --verbose \
+            > "$RUNNER_TEMP/openclaw.log" 2>&1 &
+          OPENCLAW_PID=$!
+          echo "OPENCLAW_PID=$OPENCLAW_PID" >> "$GITHUB_ENV"
+
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:18789 >/dev/null; then
+              echo "OpenClaw Gateway is running"
+              exit 0
+            fi
+            if ! kill -0 "$OPENCLAW_PID" 2>/dev/null; then
+              echo "::error::OpenClaw exited unexpectedly"
+              cat "$RUNNER_TEMP/openclaw.log"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "::error::OpenClaw failed to start"
+          cat "$RUNNER_TEMP/openclaw.log"
+          exit 1
+
+      - name: Start automatic device approver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/approve-devices.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+
+          while true; do
+            OUTPUT="$(openclaw devices list 2>/dev/null || true)"
+
+            while IFS= read -r DEVICE_ID; do
+              [ -n "$DEVICE_ID" ] || continue
+              echo "Approving device: $DEVICE_ID"
+              openclaw devices approve "$DEVICE_ID" || true
+            done < <(
+              printf '%s\n' "$OUTPUT" |
+                grep -iE 'pending|pair|request' |
+                grep -oE \
+                  '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' |
+                sort -u || true
+            )
+
+            sleep 3
+          done
+          SCRIPT
+
+          chmod +x "$RUNNER_TEMP/approve-devices.sh"
+
+          nohup "$RUNNER_TEMP/approve-devices.sh" \
+            > "$RUNNER_TEMP/device-approver.log" 2>&1 &
+          DEVICE_APPROVER_PID=$!
+          echo "DEVICE_APPROVER_PID=$DEVICE_APPROVER_PID" >> "$GITHUB_ENV"
+
+      - name: Start Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nohup cloudflared tunnel \
+            --no-autoupdate \
+            --url http://127.0.0.1:18789 \
+            > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          CLOUDFLARED_PID=$!
+          echo "CLOUDFLARED_PID=$CLOUDFLARED_PID" >> "$GITHUB_ENV"
+
+          for attempt in {1..60}; do
+            TUNNEL_URL="$(
+              grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+                "$RUNNER_TEMP/cloudflared.log" | head -n 1 || true
+            )"
+
+            if [ -n "$TUNNEL_URL" ]; then
+              WEBSOCKET_URL="${TUNNEL_URL/https:/wss:}"
+              echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+
+              POOL_LIST="$(python3 -c "
+          import json, os
+          p = os.path.join(os.environ['OPENCLAW_HOME'], 'pool.json')
+          try: pool = json.load(open(p))
+          except Exception: pool = []
+          print(', '.join(x['id'] for x in pool) or 'none')
+          ")"
+
+              {
+                echo "## OpenClaw Gateway"
+                echo
+                echo "Dashboard: $TUNNEL_URL"
+                echo
+                echo "WebSocket: $WEBSOCKET_URL"
+                echo
+                echo "Rotating pool: \`$POOL_LIST\`"
+                echo
+                echo "Router: LiteLLM \`pool-auto\` (NVIDIA NIM + Mistral, all keys rotated)"
+                echo
+                echo "Browser: Camoufox (anti-detect)"
+                echo
+                echo "Backup: hot every 5 min, full every 15 min, final on exit"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              echo "::notice title=OpenClaw Gateway::$TUNNEL_URL"
+
+              # publish live run info so the config site can show it
+              python3 /tmp/poolctl.py --runtime \
+                "gatewayUrl=$TUNNEL_URL" "websocketUrl=$WEBSOCKET_URL" \
+                "startedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "state=online" || true
+
+              exit 0
+            fi
+
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "::error::Cloudflare Tunnel exited unexpectedly"
+              cat "$RUNNER_TEMP/cloudflared.log"
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cloudflare Tunnel failed to start"
+          cat "$RUNNER_TEMP/cloudflared.log"
+          exit 1
+
+      # ─────────────────────────────────────────────────────────────
+      # 5. BACKUP LOOP
+      #    hot save (small, seconds) every 5 min  -> `hot` branch
+      #    full save (everything)   every 15 min  -> `backup` branch
+      #    both survive cancels; final push goes to `main`
+      # ─────────────────────────────────────────────────────────────
+      - name: Start backup loop
+        shell: bash
+        run: |
+          if [ -z "${DATA_REPO:-}" ] || [ -z "${DATA_REPO_TOKEN:-}" ]; then
+            echo "::warning::DATA_REPO / DATA_REPO_TOKEN not set - backups DISABLED"
+            exit 0
+          fi
+
+          # ── mirror everything OpenClaw stores outside $OPENCLAW_HOME ──
+          cat > /tmp/mirror.sh <<'MIREOF'
+          #!/bin/bash
+          mkdir -p "$OPENCLAW_HOME/xdg-mirror/config" \
+                   "$OPENCLAW_HOME/xdg-mirror/share" \
+                   "$OPENCLAW_HOME/xdg-mirror/state"
+          for d in "$HOME/.config"/openclaw* "$HOME/.config"/claw*; do
+            [ -e "$d" ] && rsync -a --delete "$d" "$OPENCLAW_HOME/xdg-mirror/config/" || true
+          done
+          for d in "$HOME/.local/share"/openclaw* "$HOME/.local/share"/claw*; do
+            [ -e "$d" ] && rsync -a --delete "$d" "$OPENCLAW_HOME/xdg-mirror/share/" || true
+          done
+          for d in "$HOME/.local/state"/openclaw* "$HOME/.local/state"/claw*; do
+            [ -e "$d" ] && rsync -a --delete "$d" "$OPENCLAW_HOME/xdg-mirror/state/" || true
+          done
+          MIREOF
+          chmod +x /tmp/mirror.sh
+
+          # ── CRITICAL-ONLY FAST SAVE (finishes in seconds, survives cancel) ──
+          cat > /tmp/hotsave.sh <<'HOTEOF'
+          #!/bin/bash
+          /tmp/mirror.sh || true
+          rm -rf /tmp/hot && mkdir -p /tmp/hot
+          for d in xdg-mirror agents agent sessions session memory memories skills \
+                   tasks notes knowledge prompts plugins projects workspace state; do
+            [ -e "$OPENCLAW_HOME/$d" ] && \
+              rsync -a --exclude='.git' --exclude='*.log' "$OPENCLAW_HOME/$d" /tmp/hot/ || true
+          done
+          find "$OPENCLAW_HOME" -maxdepth 1 -type f \
+            \( -name '*.json' -o -name '*.jsonl' -o -name '*.md' -o -name '*.txt' \
+               -o -name '*.yaml' -o -name '*.yml' -o -name '*.db' -o -name '*.sqlite*' \) \
+            ! -name 'openclaw.json' ! -name '.env' -exec cp -a {} /tmp/hot/ \; 2>/dev/null || true
+          # pool.json must survive: it IS your model selection
+          [ -f "$OPENCLAW_HOME/pool.json" ] && cp -a "$OPENCLAW_HOME/pool.json" /tmp/hot/ || true
+          cd /tmp/hot || exit 0
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
+          printf '.env\nopenclaw.json\n*.log\n' > .gitignore
+          {
+            echo "# OpenClaw hot backup - saved $(date -u +%FT%TZ)"
+            echo "- pool: $(python3 -c "import json;print(', '.join(x['id'] for x in json.load(open('pool.json'))))" 2>/dev/null || echo n/a)"
+            echo "- sessions: $(find sessions session -type f 2>/dev/null | wc -l) file(s)"
+            echo "- memory: $(find memory memories -type f 2>/dev/null | wc -l) file(s)"
+            echo "- total size: $(du -sh . 2>/dev/null | cut -f1)"
+          } > BACKUP-STATUS.md
+          git init -q -b hot
+          git config user.email "bot@openclaw" && git config user.name "openclaw-bot"
+          git add -A && git commit -q -m "hot save $(date -u +%FT%TZ)" || true
+          if timeout 300 git push -f \
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" hot \
+            >/tmp/hotpush.log 2>&1; then
+            echo "Hot save pushed at $(date)"
+          else
+            echo "::warning::HOT PUSH FAILED - state NOT saved this cycle"
+            tail -3 /tmp/hotpush.log || true
+          fi
+          HOTEOF
+          chmod +x /tmp/hotsave.sh
+
+          # ── FULL SAVE (everything except secrets, caches and logs) ──
+          cat > /tmp/fullsave.sh <<'FULLEOF'
+          #!/bin/bash
+          BRANCH="${1:-backup}"
+          /tmp/mirror.sh || true
+          rm -rf /tmp/backup && mkdir -p /tmp/backup
+          rsync -a \
+            --exclude='.git' --exclude='.env' --exclude='openclaw.json' --exclude='*.log' \
+            --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
+            --exclude='browser-profile/shader-cache' \
+            --exclude='chrome-profile/Default/Cache' --exclude='chrome-profile/Default/Code Cache' \
+            --exclude='chrome-profile/Default/GPUCache' --exclude='chrome-profile/ShaderCache' \
+            --exclude='chrome-profile/GraphiteDawnCache' \
+            --exclude='cache' --exclude='Cache' --exclude='node_modules' \
+            "$OPENCLAW_HOME/" /tmp/backup/ || true
+          cd /tmp/backup || exit 0
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
+          printf '.env\nopenclaw.json\n*.log\n' > .gitignore
+          {
+            echo "# OpenClaw full backup ($BRANCH) - saved $(date -u +%FT%TZ)"
+            echo "- pool: $(python3 -c "import json;print(', '.join(x['id'] for x in json.load(open('pool.json'))))" 2>/dev/null || echo n/a)"
+            echo "- files: $(find . -type f | wc -l)"
+            echo "- total size: $(du -sh . 2>/dev/null | cut -f1)"
+          } > BACKUP-STATUS.md
+          git init -q -b "$BRANCH"
+          git config user.email "bot@openclaw" && git config user.name "openclaw-bot"
+          git add -A && git commit -q -m "$BRANCH save $(date -u +%FT%TZ)" || true
+          if git push -f \
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" "$BRANCH" \
+            >/tmp/bkpush.log 2>&1; then
+            echo "$BRANCH pushed at $(date)"
+          else
+            echo "::warning::${BRANCH} PUSH FAILED"
+            tail -3 /tmp/bkpush.log || true
+          fi
+          FULLEOF
+          chmod +x /tmp/fullsave.sh
+
+          cat > /tmp/sync.sh <<'EOF'
+          #!/bin/bash
+          # last-gasp save if this loop is signalled
+          trap '/tmp/hotsave.sh; exit 0' TERM INT HUP
+          n=0
+          while true; do
+            sleep 300 & wait $!
+            /tmp/hotsave.sh || true
+            n=$((n+1))
+            [ $((n % 3)) -eq 0 ] || continue
+            /tmp/fullsave.sh backup || true
+          done
+          EOF
+          chmod +x /tmp/sync.sh
+
+          # persist creds for the emergency step (fresh shell)
+          printf 'export OPENCLAW_HOME=%s\nexport DATA_REPO=%s\nexport DATA_REPO_TOKEN=%s\n' \
+            "$OPENCLAW_HOME" "$DATA_REPO" "$DATA_REPO_TOKEN" > /tmp/save.env
+          chmod 600 /tmp/save.env
+
+          export OPENCLAW_HOME DATA_REPO DATA_REPO_TOKEN
+          setsid nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+          echo "BACKUP_LOOP_PID=$!" >> "$GITHUB_ENV"
+
+          # save immediately so state is protected from minute one
+          /tmp/hotsave.sh || true
+
+      - name: Keep runner alive
+        shell: bash
+        env:
+          REQUESTED_HOURS: ${{ inputs.duration }}
+        run: |
+          set -euo pipefail
+
+          HOURS="${RUN_HOURS_FINAL:-6}"
+          END_TIME=$((SECONDS + HOURS * 3600))
+
+          echo "Gateway: $TUNNEL_URL"
+          echo "Model pool: managed from your Firebase config site"
+          echo "Keeping gateway active for $HOURS hour(s)"
+
+          while (( SECONDS < END_TIME )); do
+            for PROCESS_ID in \
+              "$OPENCLAW_PID" \
+              "$DEVICE_APPROVER_PID" \
+              "$CLOUDFLARED_PID" \
+              "$CAMOFOX_PID"
+            do
+              if ! kill -0 "$PROCESS_ID" 2>/dev/null; then
+                echo "::error::A required process stopped"
+                exit 1
+              fi
+            done
+
+            if ! curl --fail --silent http://127.0.0.1:18789 >/dev/null; then
+              echo "::error::OpenClaw stopped responding"
+              exit 1
+            fi
+
+            if ! curl --fail --silent http://127.0.0.1:9377/health >/dev/null; then
+              echo "::error::Camoufox stopped responding"
+              exit 1
+            fi
+
+            # router watchdog: restart LiteLLM instead of killing the run
+            if ! curl --fail --silent http://127.0.0.1:4000/v1/models >/dev/null; then
+              echo "::warning::LiteLLM router not responding - restarting container"
+              docker restart -t 2 litellm || true
+              sleep 20
+            fi
+
+            sleep 30
+          done
+
+      # ── EMERGENCY SAVE: runs first on ANY exit, including "Cancel workflow" ──
+      - name: Emergency state save
+        if: always()
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          [ -f /tmp/save.env ] && . /tmp/save.env || true
+          export OPENCLAW_HOME="${OPENCLAW_HOME:-/home/runner/.openclaw}"
+          if [ -x /tmp/hotsave.sh ]; then
+            /tmp/hotsave.sh || echo "::warning::hot save failed"
+          else
+            echo "::warning::hotsave.sh missing - nothing to save yet"
+          fi
+
+      # ── FINAL FULL PUSH to `main` ──
+      - name: Final data push
+        if: always()
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          [ -f /tmp/save.env ] && . /tmp/save.env || true
+          export OPENCLAW_HOME="${OPENCLAW_HOME:-/home/runner/.openclaw}"
+          if [ -z "${DATA_REPO:-}" ] || [ -z "${DATA_REPO_TOKEN:-}" ]; then
+            echo "No data repo configured - skipping final push"
+            exit 0
+          fi
+          # critical state first, then the full tree
+          [ -x /tmp/hotsave.sh ] && /tmp/hotsave.sh || true
+          [ -x /tmp/fullsave.sh ] && /tmp/fullsave.sh main || true
+
+      - name: Show diagnostic logs
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== LiteLLM router ====="
+          docker logs --tail 120 litellm 2>&1 || true
+
+          echo "===== Model pool controller ====="
+          tail -n 60 /tmp/poolctl.log 2>/dev/null || true
+
+          echo "===== Backup loop ====="
+          tail -n 60 /tmp/sync.log 2>/dev/null || true
+
+          echo "===== OpenClaw ====="
+          tail -n 150 "$RUNNER_TEMP/openclaw.log" 2>/dev/null || true
+
+          echo "===== Camoufox ====="
+          tail -n 100 "$RUNNER_TEMP/camofox.log" 2>/dev/null || true
+
+          echo "===== Device approver ====="
+          tail -n 100 "$RUNNER_TEMP/device-approver.log" 2>/dev/null || true
+
+          echo "===== Cloudflared ====="
+          tail -n 100 "$RUNNER_TEMP/cloudflared.log" 2>/dev/null || true
