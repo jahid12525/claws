@@ -1001,9 +1001,9 @@ jobs:
               messages: {
                 tts: { auto: "always", provider: "microsoft" }
               }
-            }' > "$OPENCLAW_HOME/openclaw.json"
+            }' > /tmp/openclaw.json
 
-          cat > "$OPENCLAW_HOME/exec-approvals.json" <<'EOF'
+          cat > /tmp/exec-approvals.json <<'EOF'
           {
             "version": 1,
             "defaults": {
@@ -1014,9 +1014,32 @@ jobs:
           }
           EOF
 
-          chmod 600 \
-            "$OPENCLAW_HOME/openclaw.json" \
-            "$OPENCLAW_HOME/exec-approvals.json"
+          # OpenClaw treats OPENCLAW_HOME as a BASE directory and appends
+          # ".openclaw" to it, so the file it really reads is
+          # $OPENCLAW_HOME/.openclaw/openclaw.json. Writing only to
+          # $OPENCLAW_HOME/openclaw.json left the gateway reading an empty
+          # auto-created config -> "existing config is missing gateway.mode".
+          # Install into every location OpenClaw might resolve, and keep them
+          # identical so a restored backup can never reintroduce a stale copy.
+          CONFIG_DIRS="$OPENCLAW_HOME $OPENCLAW_HOME/.openclaw"
+
+          for d in $CONFIG_DIRS; do
+            mkdir -p "$d"
+            install -m 600 /tmp/openclaw.json       "$d/openclaw.json"
+            install -m 600 /tmp/exec-approvals.json "$d/exec-approvals.json"
+          done
+
+          rm -f /tmp/openclaw.json /tmp/exec-approvals.json
+
+          # fail loudly here instead of leaving the gateway to refuse to boot
+          for d in $CONFIG_DIRS; do
+            MODE="$(jq -r '.gateway.mode // empty' "$d/openclaw.json")"
+            if [ "$MODE" != "local" ]; then
+              echo "::error::$d/openclaw.json has gateway.mode='$MODE', expected 'local'"
+              exit 1
+            fi
+            echo "config ok: $d/openclaw.json (gateway.mode=$MODE)"
+          done
 
           openclaw doctor
 
@@ -1059,6 +1082,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Show which config file the gateway resolves, so a path mismatch is
+          # obvious in the log instead of surfacing as a cryptic start block.
+          echo "OPENCLAW_HOME=$OPENCLAW_HOME"
+          ls -la "$OPENCLAW_HOME" "$OPENCLAW_HOME/.openclaw" 2>/dev/null || true
 
           nohup openclaw gateway --port 18789 --verbose \
             > "$RUNNER_TEMP/openclaw.log" 2>&1 &
